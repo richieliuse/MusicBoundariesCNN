@@ -7,6 +7,7 @@ from scipy.spatial import distance
 import os
 import pathlib
 from multiprocessing import Pool
+from numba import jit
 
 
 # window_size = 2048  # (samples/frame)
@@ -98,6 +99,49 @@ def mls(input_signal, sr=44100, window_size=2048, hop_length=1024, pooling_facto
     return output_singal
 
 
+@jit(nopython=True, fastmath=True)
+def compute_epsilon(distances, padding_factor, first_pooling_factor, kappa):
+    epsilon = np.zeros(
+        (distances.shape[0], padding_factor // first_pooling_factor)
+    )  # D has as dimensions N/p and L/p
+    for i in range(
+        padding_factor // first_pooling_factor, distances.shape[0]
+    ):  # iteration in columns of x_hat
+        for j in range(padding_factor // first_pooling_factor):
+            epsilon[i, j] = np.quantile(
+                np.concatenate((distances[i - j, :], distances[i, :])), kappa
+            )
+
+    return epsilon
+
+
+def compute_distances(x_hat, padding_factor, first_pooling_factor, distance_type):
+    distances = np.zeros(
+        (x_hat.shape[1], padding_factor // first_pooling_factor)
+    )  # D has as dimensions N/p and L/p
+    for i in range(x_hat.shape[1]):  # iteration in columns of x_hat
+        for j in range(padding_factor // first_pooling_factor):
+            if i - (j + 1) < 0:
+                cosine_dist = 1
+            elif i - (j + 1) < padding_factor // first_pooling_factor:
+                cosine_dist = 1
+            else:
+                if distance_type == 'cosine':
+                    cosine_dist = distance.cosine(x_hat[:, i], x_hat[:, i - (j + 1)])
+                elif distance_type == 'euclidean':
+                    cosine_dist = distance.euclidean(
+                        x_hat[:, i], x_hat[:, i - (j + 1)]
+                    )  # cosine distance between columns i and i-L
+                else:
+                    cosine_dist = 0
+
+                if cosine_dist == float('nan'):
+                    cosine_dist = 0
+            distances[i, j] = cosine_dist
+
+    return distances
+
+
 def sslm(
     input_signal,
     sr=44100,
@@ -107,7 +151,7 @@ def sslm(
     second_pooling_factor=3,
     lag=30,
     feature_type='chromas',
-    distance_type="cosine"
+    distance_type="cosine",
 ):
     """SSLM extraction, including MFCCs and Chromas.
 
@@ -176,45 +220,17 @@ def sslm(
     x_hat = np.concatenate(x, axis=0)
 
     # Cosine distance calculation: D[N/p,L/p] matrix
-    distances = np.zeros(
-        (x_hat.shape[1], padding_factor // first_pooling_factor)
-    )  # D has as dimensions N/p and L/p
-    for i in range(x_hat.shape[1]):  # iteration in columns of x_hat
-        for l in range(padding_factor // first_pooling_factor):
-            if i - (l + 1) < 0:
-                cosine_dist = 1
-            elif i - (l + 1) < padding_factor // first_pooling_factor:
-                cosine_dist = 1
-            else:
-                if distance_type == 'cosine':
-                    cosine_dist = distance.cosine(x_hat[:, i], x_hat[:, i - (l + 1)])
-                elif distance_type == 'euclidean':
-                    cosine_dist = distance.euclidean(
-                        x_hat[:, i], x_hat[:, i - (l + 1)]
-                    )  # cosine distance between columns i and i-L
-                else:
-                    cosine_dist = 0
-
-                if cosine_dist == float('nan'):
-                    cosine_dist = 0
-            distances[i, l] = cosine_dist
+    distances = compute_distances(
+        x_hat, padding_factor, first_pooling_factor, distance_type
+    )
 
     # Threshold epsilon[N/p,L/p] calculation
     kappa = 0.1
-    epsilon = np.zeros(
-        (distances.shape[0], padding_factor // first_pooling_factor)
-    )  # D has as dimensions N/p and L/p
-    for i in range(
-        padding_factor // first_pooling_factor, distances.shape[0]
-    ):  # iteration in columns of x_hat
-        for l in range(padding_factor // first_pooling_factor):
-            epsilon[i, l] = np.quantile(
-                np.concatenate((distances[i - l, :], distances[i, :])), kappa
-            )
+    epsilon = compute_epsilon(distances, kappa, first_pooling_factor)
 
     # We remove the padding done before
-    distances = distances[padding_factor // first_pooling_factor :, :]
-    epsilon = epsilon[padding_factor // first_pooling_factor :, :]
+    distances = distances[padding_factor // first_pooling_factor:, :]
+    epsilon = epsilon[padding_factor // first_pooling_factor:, :]
     # x_prime = x_prime[:, padding_factor // first_pooling_factor:]
 
     # Self Similarity Lag Matrix
@@ -283,7 +299,7 @@ def mls_sslm_extraction(audio_file, sr_desired=44100):
                 sr=sr,
                 lag=l_frames,
                 feature_type='chromas',
-                distance_type='cosine'
+                distance_type='cosine',
             )
             save_data(
                 os.path.join(im_path_SSLM_Chromas_cosine, file_name + ".npy"),
@@ -297,7 +313,7 @@ def mls_sslm_extraction(audio_file, sr_desired=44100):
                 sr=sr,
                 lag=l_frames,
                 feature_type='chromas',
-                distance_type='euclidean'
+                distance_type='euclidean',
             )
             save_data(
                 os.path.join(im_path_SSLM_Chromas_euclidean, file_name + ".npy"),
@@ -311,7 +327,7 @@ def mls_sslm_extraction(audio_file, sr_desired=44100):
                 sr=sr,
                 lag=l_frames,
                 feature_type='mfccs',
-                distance_type='cosine'
+                distance_type='cosine',
             )
             save_data(
                 os.path.join(im_path_SSLM_MFCCs_cosine, file_name + ".npy"),
@@ -325,7 +341,7 @@ def mls_sslm_extraction(audio_file, sr_desired=44100):
                 sr=sr,
                 lag=l_frames,
                 feature_type='mfccs',
-                distance_type='euclidean'
+                distance_type='euclidean',
             )
             save_data(
                 os.path.join(im_path_SSLM_MFCCs_euclidean, file_name + ".npy"),
