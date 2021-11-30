@@ -226,7 +226,7 @@ def sslm(
 
     # Threshold epsilon[N/p,L/p] calculation
     kappa = 0.1
-    epsilon = compute_epsilon(distances, kappa, first_pooling_factor)
+    epsilon = compute_epsilon(distances, padding_factor, first_pooling_factor, kappa)
 
     # We remove the padding done before
     distances = distances[padding_factor // first_pooling_factor:, :]
