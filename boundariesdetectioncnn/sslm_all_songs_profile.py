@@ -1,17 +1,19 @@
 import librosa
 import librosa.display
+import librosa.core.audio
 import numpy as np
 import skimage.measure
 import scipy
-from scipy.spatial import distance
+# from scipy.spatial import distance
 import os
 import pathlib
 from multiprocessing import Pool
 from pyinstrument import Profiler
 import cupy as cp
 import cucim.skimage.measure
-from fastdist import fastdist
+# from fastdist import fastdist
 from numba import jit, njit, prange, guvectorize
+import audioread
 
 # window_size = 2048  # (samples/frame)
 # hop_length = 1024  # overlap 50% (samples/frame)
@@ -34,6 +36,97 @@ im_path_SSLM_Chromas_euclidean = os.path.join(im_path_base, "SSLM_Chromas_euclid
 im_path_SSLM_Chromas_cosine = os.path.join(im_path_base, "SSLM_Chromas_cosine/")
 
 
+def buf_to_float(x, n_bytes=2, dtype=np.float32):
+    """Convert an integer buffer to floating point values.
+    This is primarily useful when loading integer-valued wav data
+    into numpy arrays.
+
+    Parameters
+    ----------
+    x : np.ndarray [dtype=int]
+        The integer-valued data buffer
+
+    n_bytes : int [1, 2, 4]
+        The number of bytes per sample in ``x``
+
+    dtype : numeric type
+        The target output type (default: 32-bit float)
+
+    Returns
+    -------
+    x_float : np.ndarray [dtype=float]
+        The input data buffer cast to floating point
+    """
+
+    # Invert the scale of the data
+    scale = 1.0 / float(1 << ((8 * n_bytes) - 1))
+
+    # Construct the format string
+    fmt = "<i{:d}".format(n_bytes)
+
+    # Rescale and format the data buffer
+    return scale * np.frombuffer(x, fmt).astype(dtype)
+
+
+def to_mono(y):
+    if y.ndim > 1:
+        y = np.mean(y, axis=tuple(range(y.ndim-1)))
+
+    return y
+
+
+def ar_load(path, offset, duration, dtype):
+    y = []
+    with audioread.audio_open(path) as input_file:
+        sr_native = input_file.samplerate
+        n_channels = input_file.channels
+
+        s_start = int(np.round(sr_native * offset)) * n_channels
+
+        if duration is None:
+            s_end = np.inf
+        else:
+            s_end = s_start + (int(np.round(sr_native * duration)) * n_channels)
+
+        n = 0
+
+        for frame in input_file:
+            frame = buf_to_float(frame, dtype=dtype)
+            n_prev = n
+            n = n + len(frame)
+
+            if n < s_start:
+                # offset is after the current frame
+                # keep reading
+                continue
+
+            if s_end < n_prev:
+                # we're off the end.  stop reading
+                break
+
+            if s_end < n:
+                # the end is in this frame.  crop.
+                frame = frame[: s_end - n_prev]
+
+            if n_prev <= s_start <= n:
+                # beginning is in this frame
+                frame = frame[(s_start - n_prev):]
+
+            # tack on the current frame
+            y.append(frame)
+
+    if y:
+        y = np.concatenate(y)
+        if n_channels > 1:
+            y = y.reshape((-1, n_channels)).T
+    else:
+        y = np.empty(0, dtype=dtype)
+
+    y = to_mono(y)
+
+    return y, sr_native
+
+
 def split_filename(filename, full_name=True):
     path = pathlib.Path(filename)
     if full_name:
@@ -43,15 +136,10 @@ def split_filename(filename, full_name=True):
 
 def load_audio(input_audio, sr_desired):
     "This function loads the audio file and resamples it to sr_desired"
-    # file_name, file_suffix = split_filename(input_audio)
-    # y = None
-    # sr = 0
-    # if file_suffix == ".mp3":
-    #     audioread.audio_open(input_audio)
-    # else:
-    #     y, sr = librosa.load(input_audio, sr=sr_desired)
+    file_name, file_suffix = split_filename(input_audio)
+    y, sr = ar_load(path=input_audio, offset=0.0, duration=None, dtype=np.float32) if file_suffix == ".mp3" else librosa.load(input_audio, sr=sr_desired)
 
-    y, sr = librosa.load(input_audio, sr=sr_desired)
+    # y, sr = librosa.load(input_audio, sr=sr_desired)
     if sr != sr_desired:
         y = librosa.core.resample(y, sr, sr_desired)
         sr = sr_desired
@@ -253,9 +341,9 @@ def compute_epsilon(distances, padding_factor, first_pooling_factor, kappa):
     for i in range(
         padding_factor // first_pooling_factor, distances.shape[0]
     ):  # iteration in columns of x_hat
-        for l in range(padding_factor // first_pooling_factor):
-            epsilon[i, l] = np.quantile(
-                np.concatenate((distances[i - l, :], distances[i, :])), kappa
+        for j in range(padding_factor // first_pooling_factor):
+            epsilon[i, j] = np.quantile(
+                np.concatenate((distances[i - j, :], distances[i, :])), kappa
             )
 
     return epsilon
@@ -349,8 +437,8 @@ def sslm(
     epsilon = compute_epsilon(distances, padding_factor, first_pooling_factor, kappa)
 
     # We remove the padding done before
-    distances = distances[padding_factor // first_pooling_factor :, :]
-    epsilon = epsilon[padding_factor // first_pooling_factor :, :]
+    distances = distances[padding_factor // first_pooling_factor:, :]
+    epsilon = epsilon[padding_factor // first_pooling_factor:, :]
     # x_prime = x_prime[:, padding_factor // first_pooling_factor:]
 
     # Self Similarity Lag Matrix
