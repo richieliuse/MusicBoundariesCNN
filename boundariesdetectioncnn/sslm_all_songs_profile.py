@@ -10,8 +10,8 @@ from multiprocessing import Pool
 from pyinstrument import Profiler
 import cupy as cp
 import cucim.skimage.measure
-# from fastdist import fastdist
-from numba import jit
+from fastdist import fastdist
+from numba import jit, njit, prange, guvectorize
 
 # window_size = 2048  # (samples/frame)
 # hop_length = 1024  # overlap 50% (samples/frame)
@@ -109,32 +109,90 @@ def mls(input_signal, sr=44100, window_size=2048, hop_length=1024, pooling_facto
     return output_singal
 
 
-def compute_distances(x_hat, padding_factor, first_pooling_factor, distance_type):
-    # Cosine distance calculation: D[N/p,L/p] matrix
-    distances = np.zeros(
-        (x_hat.shape[1], padding_factor // first_pooling_factor)
-    )  # D has as dimensions N/p and L/p
-    for i in range(x_hat.shape[1]):  # iteration in columns of x_hat
-        for l in range(padding_factor // first_pooling_factor):
-            if i - (l + 1) < 0:
-                cosine_dist = 1
-            elif i - (l + 1) < padding_factor // first_pooling_factor:
-                cosine_dist = 1
-            else:
-                if distance_type == 'cosine':
-                    cosine_dist = distance.cosine(x_hat[:, i], x_hat[:, i - (l + 1)])
-                elif distance_type == 'euclidean':
-                    cosine_dist = distance.euclidean(x_hat[:, i], x_hat[:, i - (l + 1)])  # cosine distance between columns i and i-L
-                else:
-                    cosine_dist = 0
+# @njit
+# def compute_distances(x_hat, padding_factor, first_pooling_factor, distance_type):
+#     # Cosine distance calculation: D[N/p,L/p] matrix
+#     distances = np.zeros(
+#         (x_hat.shape[1], padding_factor // first_pooling_factor)
+#     )  # D has as dimensions N/p and L/p
+#     for i in range(x_hat.shape[1]):  # iteration in columns of x_hat
+#         for l in range(padding_factor // first_pooling_factor):
+#             if i - (l + 1) < 0:
+#                 cosine_dist = 1
+#             elif i - (l + 1) < padding_factor // first_pooling_factor:
+#                 cosine_dist = 1
+#             else:
+#                 if distance_type == 'cosine':
+#                     cosine_dist = distance.cosine(x_hat[:, i], x_hat[:, i - (l + 1)])
+#                 elif distance_type == 'euclidean':
+#                     cosine_dist = distance.euclidean(x_hat[:, i], x_hat[:, i - (l + 1)])  # cosine distance between columns i and i-L
+#                 else:
+#                     cosine_dist = 0
 
-                if cosine_dist == float('nan'):
-                    cosine_dist = 0
-            distances[i, l] = cosine_dist
+#                 if cosine_dist == float('nan'):
+#                     cosine_dist = 0
+#             distances[i, l] = cosine_dist
+#     return distances
 
-    return distances
 
-@jit(nopython=True, fastmath=True)
+@njit(fastmath=True, parallel=True)
+def eucl_naive(A, B):
+    assert A.shape[1] == B.shape[1]
+    C = np.empty((A.shape[0], B.shape[0]), A.dtype)
+
+    # workaround to get the right datatype for acc
+    init_val_arr = np.zeros(1, A.dtype)
+    init_val = init_val_arr[0]
+
+    for i in prange(A.shape[0]):
+        for j in range(B.shape[0]):
+            acc = init_val
+            for k in range(A.shape[1]):
+                acc += (A[i, k] - B[j, k]) ** 2
+            C[i, j] = np.sqrt(acc)
+    return C
+
+
+@guvectorize(["void(float64[:], float64[:], float64[:])"], "(n),(n)->()", target='parallel')
+def fast_cosine_gufunc(u, v, result):
+    m = u.shape[0]
+    udotv = 0
+    u_norm = 0
+    v_norm = 0
+    for i in range(m):
+        if (np.isnan(u[i])) or (np.isnan(v[i])):
+            continue
+
+        udotv += u[i] * v[i]
+        u_norm += u[i] * u[i]
+        v_norm += v[i] * v[i]
+
+    u_norm = np.sqrt(u_norm)
+    v_norm = np.sqrt(v_norm)
+
+    if (u_norm == 0) or (v_norm == 0):
+        ratio = 1.0
+    else:
+        ratio = 1 - udotv / (u_norm * v_norm)
+    result[:] = ratio
+
+
+@guvectorize(["void(float64[:], float64[:], float64[:])"], "(n),(n)->()", target='parallel')
+def fast_euclidean_gufunc(u, v, result):
+    m = u.shape[0]
+    udotv = 0
+    for i in range(m):
+        if (np.isnan(u[i])) or (np.isnan(v[i])):
+            continue
+
+        udotv += abs(u[i] - v[i]) ** 2
+
+    dist = udotv ** (1 / 2)
+    result[:] = dist
+
+
+# @jit(nopython=True, fastmath=True)
+@njit(fastmath=True, parallel=True)
 def compute_dist_cosine(u, v):
     n = u.size
     num = 0
@@ -145,39 +203,46 @@ def compute_dist_cosine(u, v):
         v_norm += abs(v[i]) ** 2
 
     denom = (u_norm * v_norm) ** (1 / 2)
-    return num / denom
+    result = num / denom
+    return result
 
 
-@jit(nopython=True, fastmath=True)
+# @jit(nopython=True, fastmath=True)
+@njit(fastmath=True, parallel=True)
 def compute_dist_euclidean(u, v):
     n = u.size
     dist = 0
     for i in range(n):
         dist += abs(u[i] - v[i]) ** 2
-    return dist ** (1 / 2)
+    result = dist ** (1 / 2)
+    return result
 
 
-# @jit(nopython=True, fastmath=True)
-# def compute_distances(x_hat, padding_factor, first_pooling_factor, distance_type):
-#     # Cosine distance calculation: D[N/p,L/p] matrix
-#     distances = np.zeros(
-#         (x_hat.shape[1], padding_factor // first_pooling_factor)
-#     )  # D has as dimensions N/p and L/p
-#     for i in range(x_hat.shape[1]):  # iteration in columns of x_hat
-#         for j in range(padding_factor // first_pooling_factor):
-#             t_dist = 0
-#             # if i - (l + 1) < 0:
-#             #     t_dist = 1
-#             if i - (j + 1) < padding_factor // first_pooling_factor:
-#                 t_dist = 1
-#             else:
-#                 t_dist = 1 - compute_dist_cosine(x_hat[:, i], x_hat[:, i - (j + 1)]) if distance_type == 'cosine' else compute_dist_euclidean(x_hat[:, i], x_hat[:, i - (j + 1)])
+# @jit
+def compute_distances(x_hat, padding_factor, first_pooling_factor, distance_type):
+    # Cosine distance calculation: D[N/p,L/p] matrix
+    distances = np.zeros(
+        (x_hat.shape[1], padding_factor // first_pooling_factor)
+    )  # D has as dimensions N/p and L/p
+    tmp_r = np.zeros(1)
+    for i in range(x_hat.shape[1]):  # iteration in columns of x_hat
+        for j in range(padding_factor // first_pooling_factor):
+            t_dist = 0
+            # if i - (l + 1) < 0:
+            #     t_dist = 1
+            if i - (j + 1) < padding_factor // first_pooling_factor:
+                t_dist = 1
+            else:
+                # t_dist = 1 - compute_dist_cosine(x_hat[:, i], x_hat[:, i - (j + 1)]) if distance_type == 'cosine' else compute_dist_euclidean(x_hat[:, i], x_hat[:, i - (j + 1)])
+                if distance_type == 'cosine':
+                    t_dist = fast_cosine_gufunc(x_hat[:, i], x_hat[:, i - (j + 1)], tmp_r)[0]
+                else:
+                    t_dist = fast_euclidean_gufunc(x_hat[:, i], x_hat[:, i - (j + 1)], tmp_r)[0]
 
-#                 if t_dist == float('nan'):
-#                     t_dist = 0
-#             distances[i, j] = t_dist
-
-#     return distances
+                if t_dist == float('nan'):
+                    t_dist = 0
+            distances[i, j] = t_dist
+    return distances
 
 
 @jit(nopython=True, fastmath=True)
@@ -205,7 +270,7 @@ def sslm(
     second_pooling_factor=3,
     lag=30,
     feature_type='chromas',
-    distance_type="cosine"
+    distance_type="cosine",
 ):
     """SSLM extraction, including MFCCs and Chromas.
 
@@ -274,7 +339,9 @@ def sslm(
     x_hat = np.concatenate(x, axis=0)
 
     # Cosine distance calculation: D[N/p,L/p] matrix
-    distances = compute_distances(x_hat, padding_factor, first_pooling_factor, distance_type)
+    distances = compute_distances(
+        x_hat, padding_factor, first_pooling_factor, distance_type
+    )
 
     # Threshold epsilon[N/p,L/p] calculation
     kappa = 0.1
@@ -365,7 +432,7 @@ def mls_sslm_extraction(audio_file, sr_desired=44100):
                 sr=sr,
                 lag=l_frames,
                 feature_type='chromas',
-                distance_type='cosine'
+                distance_type='cosine',
             )
             save_data(
                 os.path.join(im_path_SSLM_Chromas_cosine, file_name + ".npy"),
@@ -379,7 +446,7 @@ def mls_sslm_extraction(audio_file, sr_desired=44100):
                 sr=sr,
                 lag=l_frames,
                 feature_type='chromas',
-                distance_type='euclidean'
+                distance_type='euclidean',
             )
             save_data(
                 os.path.join(im_path_SSLM_Chromas_euclidean, file_name + ".npy"),
@@ -393,7 +460,7 @@ def mls_sslm_extraction(audio_file, sr_desired=44100):
                 sr=sr,
                 lag=l_frames,
                 feature_type='mfccs',
-                distance_type='cosine'
+                distance_type='cosine',
             )
             save_data(
                 os.path.join(im_path_SSLM_MFCCs_cosine, file_name + ".npy"),
@@ -407,7 +474,7 @@ def mls_sslm_extraction(audio_file, sr_desired=44100):
                 sr=sr,
                 lag=l_frames,
                 feature_type='mfccs',
-                distance_type='euclidean'
+                distance_type='euclidean',
             )
             save_data(
                 os.path.join(im_path_SSLM_MFCCs_euclidean, file_name + ".npy"),
