@@ -154,7 +154,7 @@ def save_data(save_path, input_data):
     np.save(save_path, input_data)
 
 
-def lag_near_frames(lag_near_sec=14, sr=44100, hop_length=1024):
+def lag_near_frames(lag_near_sec=13.93, sr=44100, hop_length=1024):
     return round(lag_near_sec * sr / hop_length)
 
 
@@ -587,7 +587,7 @@ profiler = Profiler()
 profiler.start()
 
 # batch_mls_sslm_extraction(audio_path)
-mls_sslm_extraction("/home/richie/Desktop/test_songs/Charlie Puth - Girlfriend.mp3")
+mls_sslm_extraction("/home/richie/Desktop/test_songs/The Weeknd - Blinding Lights.mp3")
 
 profiler.stop()
 print(profiler.output_text(unicode=True, color=True))
